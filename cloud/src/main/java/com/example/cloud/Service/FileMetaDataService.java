@@ -5,15 +5,21 @@ import com.example.cloud.Entity.FileMetaDataDocument;
 import com.example.cloud.Entity.Profile;
 import com.example.cloud.repo.FileMetaDataDocumentRepo;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,6 +34,11 @@ public class FileMetaDataService {
     private final UserCreditService userCreditService;
     private final ProfileService profileService;
     private final FileMetaDataDocumentRepo fileMetaDataDocumentRepo;
+    private final S3Client s3Client;
+    private final FileScanService fileScanService;
+
+    @Value("${aws.s3.bucket}")
+    private String bucketName;
 
     public List<FileMetaDataDto> uploadFiles(MultipartFile[] files) throws IOException {
         Profile currentProfile = profileService.getCurrentProfile();
@@ -38,9 +49,6 @@ public class FileMetaDataService {
             throw new RuntimeException("Not enough credits to upload files");
         }
 
-        Path uploadPath = Paths.get("uploads").toAbsolutePath().normalize();
-        Files.createDirectories(uploadPath);
-
         for (MultipartFile multipartFile : files) {
             String originalFileName = StringUtils.cleanPath(multipartFile.getOriginalFilename());
             String fileExtension = "";
@@ -49,16 +57,30 @@ public class FileMetaDataService {
                 fileExtension = originalFileName.substring(dotIndex);
             }
 
+            // 🔍 Scan file with VirusTotal before uploading
+            try {
+                fileScanService.scanFile(multipartFile);
+            } catch (RuntimeException e) {
+                // Malicious file — reject immediately
+                throw e;
+            } catch (Exception e) {
+                throw new RuntimeException("File scan failed: " + e.getMessage());
+            }
+
             // Generate unique file name
             String uniqueFileName = UUID.randomUUID() + fileExtension;
 
-            // Save file to disk
-            Path targetLocation = uploadPath.resolve(uniqueFileName);
-            Files.copy(multipartFile.getInputStream(), targetLocation, StandardCopyOption.REPLACE_EXISTING);
+            // Upload directly to AWS S3 (only reached if scan passed)
+            s3Client.putObject(PutObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(uniqueFileName)
+                    .contentType(multipartFile.getContentType())
+                    .build(),
+                    RequestBody.fromInputStream(multipartFile.getInputStream(), multipartFile.getSize()));
 
             // Build metadata entity
             FileMetaDataDocument fileMetaData = FileMetaDataDocument.builder()
-                    .fileLocation(targetLocation.toString())
+                    .fileLocation(uniqueFileName)
                     .name(originalFileName)
                     .size(multipartFile.getSize())
                     .clerkId(currentProfile.getClerkId())
@@ -122,9 +144,11 @@ public class FileMetaDataService {
                 throw new RuntimeException("File does not belong to current user");
             }
 
-            // Delete from disk
-            Path filePath = Paths.get(file.getFileLocation());
-            Files.deleteIfExists(filePath);
+            // Delete from AWS S3
+            s3Client.deleteObject(DeleteObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(file.getFileLocation())
+                    .build());
 
             // Delete from DB
             fileMetaDataDocumentRepo.deleteById(id);
@@ -142,5 +166,12 @@ public class FileMetaDataService {
         fileMetaDataDocumentRepo.save(file);
 
         return maptoDto(file); // return updated status
+    }
+
+    public InputStream getFileStream(String fileLocation) {
+        return s3Client.getObject(GetObjectRequest.builder()
+                .bucket(bucketName)
+                .key(fileLocation)
+                .build());
     }
 }
